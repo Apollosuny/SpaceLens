@@ -14,6 +14,14 @@ let package = Package(
             swiftSettings: [
                 .swiftLanguageMode(.v6)
             ]
+        ),
+        .testTarget(
+            name: "SpaceLensTests",
+            dependencies: ["SpaceLens"],
+            path: "Tests/SpaceLensTests",
+            swiftSettings: [
+                .swiftLanguageMode(.v6)
+            ]
         )
     ]
 )

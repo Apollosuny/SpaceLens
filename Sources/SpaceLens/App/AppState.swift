@@ -2,25 +2,14 @@ import SwiftUI
 
 enum ScanStatus: Equatable {
     case idle
-    case scanning(fileCount: Int, byteCount: Int64, currentPath: String)
+    case scanning(ScanProgressSnapshot)
     case completed
     case error(String)
-
-    static func == (lhs: ScanStatus, rhs: ScanStatus) -> Bool {
-        switch (lhs, rhs) {
-        case (.idle, .idle): true
-        case (.completed, .completed): true
-        case let (.scanning(lf, lb, lp), .scanning(rf, rb, rp)):
-            lf == rf && lb == rb && lp == rp
-        case let (.error(l), .error(r)): l == r
-        default: false
-        }
-    }
 }
 
 enum SizeMetric: String, CaseIterable, Sendable {
-    case fileSize = "File Size"
-    case allocatedSize = "Allocated Size"
+    case fileSize = "Logical Size"
+    case allocatedSize = "Physical Size"
 }
 
 @Observable
@@ -33,6 +22,9 @@ final class AppState {
     var breadcrumbs: [FileNode] = []
     var sizeMetric: SizeMetric = .fileSize
     var showInspector: Bool = true
+    /// Report of the scan currently displayed.
+    var lastReport: ScanReport?
+    var history: [ScanHistoryEntry] = []
 
     var isScanning: Bool {
         if case .scanning = scanStatus { return true }
@@ -69,20 +61,35 @@ final class AppState {
         }
     }
 
-    func setScanCompleted(root: FileNode) {
+    func setScanCompleted(root: FileNode, report: ScanReport) {
         rootNode = root
         treemapRoot = root
         selectedNode = root
+        lastReport = report
         scanStatus = .completed
         rebuildBreadcrumbs()
     }
 
     func reset() {
+        if let retiredRoot = rootNode {
+            Self.releaseInBackground(retiredRoot)
+        }
         scanStatus = .idle
         rootNode = nil
         treemapRoot = nil
         selectedNode = nil
         breadcrumbs = []
+        lastReport = nil
+    }
+
+    /// Deallocating a tree of millions of nodes takes hundreds of milliseconds. Keep the root alive on a
+    /// background task until views have dropped their references, so the cascade of deinits runs there
+    /// instead of stalling the main thread.
+    private static func releaseInBackground(_ root: FileNode) {
+        Task.detached(priority: .background) {
+            try? await Task.sleep(for: .seconds(2))
+            withExtendedLifetime(root) {}
+        }
     }
 
     private func rebuildBreadcrumbs() {

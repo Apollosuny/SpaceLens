@@ -6,29 +6,13 @@ struct DirectoryTreeView: View {
     let sizeMetric: SizeMetric
 
     var body: some View {
-        List(selection: Binding(
-            get: { selectedNode?.id },
-            set: { id in
-                if let id {
-                    selectedNode = findNode(id: id, in: root)
-                }
-            }
-        )) {
-            OutlineGroup(root.directoryChildren, id: \.id, children: \.optionalDirectoryChildren) { node in
+        // Nodes are Hashable by identity, so selection needs no tree search.
+        List(selection: $selectedNode) {
+            OutlineGroup(root.directoryChildren, id: \.self, children: \.optionalDirectoryChildren) { node in
                 DirectoryRow(node: node, sizeMetric: sizeMetric)
             }
         }
         .listStyle(.sidebar)
-    }
-
-    private func findNode(id: UInt64, in node: FileNode) -> FileNode? {
-        if node.id == id { return node }
-        for child in node.children {
-            if let found = findNode(id: id, in: child) {
-                return found
-            }
-        }
-        return nil
     }
 }
 
@@ -45,6 +29,7 @@ struct DirectoryRow: View {
             Text(node.name)
                 .lineLimit(1)
                 .truncationMode(.middle)
+                .foregroundStyle(node.attributes.contains(.hidden) ? .secondary : .primary)
 
             Spacer()
 
@@ -57,7 +42,6 @@ struct DirectoryRow: View {
 
 private extension FileNode {
     var optionalDirectoryChildren: [FileNode]? {
-        let dirs = directoryChildren
-        return dirs.isEmpty ? nil : dirs
+        directoryChildren.isEmpty ? nil : directoryChildren
     }
 }

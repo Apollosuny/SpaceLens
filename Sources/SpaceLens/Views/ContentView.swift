@@ -3,6 +3,7 @@ import SwiftUI
 struct ContentView: View {
     @Environment(AppState.self) private var appState
     @State private var coordinator: ScanCoordinator?
+    @AppStorage("includeHiddenFiles") private var includeHiddenFiles = true
     @FocusedValue(\.zoomInAction) private var zoomIn
     @FocusedValue(\.zoomOutAction) private var zoomOut
     @FocusedValue(\.resetZoomAction) private var resetZoom
@@ -23,17 +24,18 @@ struct ContentView: View {
             ZStack {
                 switch appState.scanStatus {
                 case .idle:
-                    WelcomeView { path in
-                        coordinator?.startScan(path: path)
-                    }
+                    WelcomeView(
+                        history: appState.history,
+                        includeHiddenFiles: $includeHiddenFiles,
+                        onVolumeSelected: { path in
+                            coordinator?.startScan(path: path, options: ScanOptions(includeHiddenFiles: includeHiddenFiles))
+                        },
+                        onClearHistory: { coordinator?.clearHistory() }
+                    )
                     .transition(.opacity)
 
-                case let .scanning(fileCount, byteCount, currentPath):
-                    ScanProgressView(
-                        fileCount: fileCount,
-                        byteCount: byteCount,
-                        currentPath: currentPath
-                    ) {
+                case let .scanning(progress):
+                    ScanProgressView(progress: progress) {
                         coordinator?.cancel()
                         appState.scanStatus = .idle
                     }
@@ -41,6 +43,10 @@ struct ContentView: View {
                 case .completed:
                     if let treemapRoot = appState.treemapRoot {
                         VStack(spacing: 0) {
+                            if let report = appState.lastReport, report.inaccessibleCount > 0 {
+                                InaccessibleFoldersBanner(report: report)
+                            }
+
                             // Breadcrumb bar
                             BreadcrumbBar(
                                 breadcrumbs: appState.breadcrumbs,
@@ -91,14 +97,17 @@ struct ContentView: View {
         }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                Button {
-                    if let path = appState.rootNode?.path {
-                        coordinator?.startScan(path: path)
+                Menu {
+                    Button("Full Rescan") {
+                        coordinator?.rescan(mode: .full)
                     }
                 } label: {
                     Label("Rescan", systemImage: "arrow.clockwise")
+                } primaryAction: {
+                    coordinator?.rescan(mode: .automatic)
                 }
-                .disabled(appState.rootNode == nil)
+                .help("Rescan, re-reading only folders changed since the last scan")
+                .disabled(appState.lastReport == nil || appState.isScanning)
 
                 Button {
                     selectAndScan()
@@ -163,6 +172,66 @@ struct ContentView: View {
     private func selectAndScan() {
         coordinator?.cancel()
         appState.scanStatus = .idle
+    }
+}
+
+// MARK: - Inaccessible Folders Banner
+
+struct InaccessibleFoldersBanner: View {
+    private static let fullDiskAccessSettingsURL = URL(
+        string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+    )
+
+    let report: ScanReport
+    @State private var showsDetails = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "lock.fill")
+                .foregroundStyle(.orange)
+            Text("\(report.inaccessibleCount.formatted()) folders couldn’t be read, so sizes may be understated.")
+                .font(.callout)
+            Spacer()
+            Button("Show") { showsDetails.toggle() }
+                .popover(isPresented: $showsDetails, arrowEdge: .bottom) {
+                    InaccessibleFoldersList(report: report)
+                }
+            if let url = Self.fullDiskAccessSettingsURL {
+                Button("Grant Full Disk Access…") {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+        }
+        .controlSize(.small)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(.orange.opacity(0.12))
+    }
+}
+
+private struct InaccessibleFoldersList: View {
+    let report: ScanReport
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Skipped Folders")
+                .font(.headline)
+            List(report.inaccessiblePaths, id: \.self) { path in
+                Text(path)
+                    .font(.caption.monospaced())
+                    .textSelection(.enabled)
+            }
+            .frame(width: 480, height: 260)
+            if report.inaccessibleCount > report.inaccessiblePaths.count {
+                Text("And \((report.inaccessibleCount - report.inaccessiblePaths.count).formatted()) more.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Text("After granting Full Disk Access, relaunch SpaceLens and rescan.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding()
     }
 }
 

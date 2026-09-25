@@ -11,7 +11,9 @@ swift run SpaceLens        # Run the app
 open Package.swift         # Open in Xcode
 ```
 
-No external dependencies. No test target configured yet (`swift test` will fail). No linter configured; Swift 6 strict concurrency mode is enforced via `swiftLanguageMode(.v6)` in Package.swift.
+No external dependencies. No linter configured; Swift 6 strict concurrency mode is enforced via `swiftLanguageMode(.v6)` in Package.swift.
+
+Tests use Swift Testing (`Tests/SpaceLensTests`, `@testable import SpaceLens`) with real temporary directory fixtures. Run one suite at a time, for example `swift test --filter IncrementalScannerTests`. `ScanBenchmarkTests` only runs when `SPACELENS_BENCHMARK_PATH` is set; it needs `-c release -Xswiftc -enable-testing`.
 
 ## Architecture
 
@@ -21,12 +23,13 @@ SpaceLens is a native macOS (15.0+) SwiftUI disk space analyzer that visualizes 
 
 **AppState** (`@Observable`) is the single source of truth. It holds the scanned file tree (`rootNode: FileNode`), the current treemap view root (`treemapRoot`), selected node, and breadcrumb navigation stack. All views react to AppState changes.
 
-Scan flow: User picks folder → **ScanCoordinator** launches **FileScanner** → FileScanner uses BSD `fts_open`/`fts_read`/`fts_close` (not FileManager, for performance) → yields `ScanEvent`s via `AsyncStream` → ScanCoordinator throttles updates (50ms) and builds the **FileNode** tree → treemap renders.
+Scan flow: User picks folder → **ScanCoordinator** (MainActor glue) runs **ScanEngine** in a detached task and samples `ScanProgress` (atomic counters) at 10 Hz → the engine tries an incremental update first: load the **ScanSnapshotStore** snapshot, replay the FSEvents journal from its checkpoint (**ChangeJournal**), and re-list only changed directories (**IncrementalScanner**). It falls back to a full walk (**FileScanner**) when there is no snapshot, the journal was reset, or too much changed → the tree is published, then the snapshot and history are persisted in the background.
 
 ### Module Layout (Sources/SpaceLens/)
 
 - **App/** — Entry point (`SpaceLensApp`) and `AppState` central state management
-- **Scanning/** — `FileScanner` (BSD fts-based traversal with inode dedup, symlink handling, allocated size via blocks×512), `ScanCoordinator` (async orchestration, throttling, cancellation), `FileNode` (tree model with weak parent refs to avoid retain cycles, recursive aggregate computation)
+- **Scanning/** — `DirectoryReader` (`getattrlistbulk` wrapper), `FileScanner` (parallel TaskGroup walk plus hard-link and clone de-duplication), `ScanScope` (mount and firmlink policy), `IncrementalScanner`, `ChangeJournal` (FSEvents history replay), `ScanEngine` (UI-independent pipeline), `ScanCoordinator`, `FileNode` (tree model with identity-based `id`/`Hashable` and weak parent refs; `finalizeTree()` computes aggregates)
+- **Persistence/** — `SnapshotCodec` (varint pre-order encoding, LZ4), `ScanSnapshotStore` (Caches, 0600), `ScanHistoryStore` (Application Support JSON)
 - **Categorization/** — `FileCategory` (10 categories with colors/SF Symbols) and `FileExtensionMap` (200+ extension→category mappings)
 - **Treemap/** — `TreemapLayoutEngine` (Squarify algorithm, max 8 depth levels), `TreemapHitTester`, `TreemapRenderer` (Canvas-based with depth-darkened category colors), `TreemapView` (click/double-click/hover/context menu interactions)
 - **Views/** — `ContentView` (NavigationSplitView: sidebar tree + center treemap + inspector), `WelcomeView` (volume list with usage bars, NSOpenPanel), `ScanProgressView`, `DirectoryTreeView` (OutlineGroup), `DetailPanelView` (metadata + category breakdown)
@@ -36,6 +39,8 @@ Scan flow: User picks folder → **ScanCoordinator** launches **FileScanner** �
 
 - All data types crossing async boundaries are `Sendable`
 - FileNode uses weak parent references to break retain cycles
-- FileScanner deduplicates hard links by tracking seen inodes
+- Size semantics: `ownSize`/`totalSize` are logical; `allocatedSize`/`totalAllocatedSize` are physical as attributed. A hard-linked file is kept once. For a pure APFS clone family, only the first member seen is charged for the shared blocks
+- Symlinks are never followed. Mount points are not crossed, except `/System/Volumes/Data` when scanning `/`, where firmlinked directories are skipped
+- Published trees are immutable. Incremental scans mutate only a freshly decoded snapshot copy
 - TreemapView uses Canvas for rendering (not individual SwiftUI views) for performance
 - macOS APIs used: `NSWorkspace` (Reveal in Finder), `NSPasteboard` (clipboard), `NSOpenPanel` (folder picker)

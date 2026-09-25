@@ -3,6 +3,8 @@ import SwiftUI
 struct DetailPanelView: View {
     let node: FileNode
 
+    @State private var breakdown: [(category: FileCategory, size: Int64)] = []
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
@@ -27,8 +29,14 @@ struct DetailPanelView: View {
                 Divider()
 
                 // Size info
-                LabeledContent("File Size", value: ByteFormatter.string(from: node.totalSize))
-                LabeledContent("Allocated", value: ByteFormatter.string(from: node.totalAllocatedSize))
+                LabeledContent("Logical Size", value: ByteFormatter.string(from: node.totalSize))
+                LabeledContent("Physical Size", value: ByteFormatter.string(from: node.totalAllocatedSize))
+
+                ForEach(attributeNotes, id: \.self) { note in
+                    Label(note, systemImage: "info.circle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
 
                 if node.isDirectory {
                     LabeledContent("Files", value: "\(node.fileCount.formatted())")
@@ -46,7 +54,6 @@ struct DetailPanelView: View {
                     Text("Category Breakdown")
                         .font(.headline)
 
-                    let breakdown = node.categoryBreakdown()
                     let total = max(1, breakdown.reduce(0) { $0 + $1.size })
 
                     // Bar chart
@@ -105,5 +112,34 @@ struct DetailPanelView: View {
             }
             .padding()
         }
+        .task(id: node.id) {
+            breakdown = []
+            guard node.isDirectory else { return }
+            // Walks the whole subtree (millions of nodes for a volume root); keep it off the main actor.
+            let node = node
+            let result = await Task.detached(priority: .userInitiated) {
+                node.categoryBreakdown()
+            }.value
+            if !Task.isCancelled { breakdown = result }
+        }
+    }
+
+    private var attributeNotes: [String] {
+        let attributes = node.attributes
+        var notes: [String] = []
+        if attributes.contains(.symlink) { notes.append("Symbolic link (target not followed)") }
+        if attributes.contains(.hidden) { notes.append("Hidden") }
+        if attributes.contains(.sparse) { notes.append("Sparse file: unwritten regions use no disk space") }
+        if attributes.contains(.compressed) { notes.append("Compressed by the file system") }
+        if attributes.contains(.clone) {
+            if !attributes.contains(.cloneOwner) && node.cloneID != 0 {
+                notes.append("APFS clone: shared blocks are counted on another copy")
+            } else {
+                notes.append("APFS clone: shares blocks with other files")
+            }
+        }
+        if attributes.contains(.hardLinked) { notes.append("Has multiple hard links; counted once") }
+        if attributes.contains(.purgeable) { notes.append("Purgeable: macOS may remove it when space is needed") }
+        return notes
     }
 }
