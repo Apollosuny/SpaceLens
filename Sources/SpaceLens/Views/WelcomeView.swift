@@ -16,9 +16,14 @@ struct VolumeInfo: Identifiable {
 }
 
 struct WelcomeView: View {
+    let history: [ScanHistoryEntry]
+    @Binding var includeHiddenFiles: Bool
     let onVolumeSelected: (String) -> Void
+    let onClearHistory: () -> Void
 
     @State private var volumes: [VolumeInfo] = []
+
+    private static let maxRecentScans = 5
 
     var body: some View {
         VStack(spacing: 32) {
@@ -56,11 +61,33 @@ struct WelcomeView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.regular)
+
+            Toggle("Include hidden files", isOn: $includeHiddenFiles)
+                .toggleStyle(.checkbox)
+                .help("Hidden files still use disk space. Turn off to see only what Finder shows.")
+
+            if !recentScans.isEmpty {
+                RecentScansSection(
+                    entries: recentScans,
+                    onSelect: { onVolumeSelected($0.rootPath) },
+                    onClear: onClearHistory
+                )
+                .frame(maxWidth: 520)
+            }
         }
         .padding(.vertical, 48)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.regularMaterial)
         .onAppear { loadVolumes() }
+    }
+
+    /// Most recent scan per root, newest first.
+    private var recentScans: [ScanHistoryEntry] {
+        var seenRoots = Set<String>()
+        return history
+            .filter { seenRoots.insert($0.rootPath).inserted }
+            .prefix(Self.maxRecentScans)
+            .map { $0 }
     }
 
     private func loadVolumes() {
@@ -109,6 +136,61 @@ struct WelcomeView: View {
         if panel.runModal() == .OK, let url = panel.url {
             onVolumeSelected(url.path(percentEncoded: false))
         }
+    }
+}
+
+// MARK: - Recent Scans
+
+private struct RecentScansSection: View {
+    let entries: [ScanHistoryEntry]
+    let onSelect: (ScanHistoryEntry) -> Void
+    let onClear: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Recent Scans")
+                    .font(.headline)
+                Spacer()
+                Button("Clear", action: onClear)
+                    .buttonStyle(.link)
+                    .help("Remove scan history and cached scan results")
+            }
+
+            ForEach(entries) { entry in
+                Button {
+                    onSelect(entry)
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: entry.rootPath == "/" ? "internaldrive" : "folder")
+                            .foregroundStyle(.secondary)
+                            .frame(width: 18)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(entry.displayName)
+                                .lineLimit(1)
+                            Text(entry.rootPath)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        Spacer()
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Text(ByteFormatter.string(from: entry.report.physicalSize))
+                                .monospacedDigit()
+                            Text(entry.completedAt, format: .relative(presentation: .named))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Rescan \(entry.rootPath) (reuses the cached result when possible)")
+            }
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 12).fill(.white.opacity(0.04)))
     }
 }
 

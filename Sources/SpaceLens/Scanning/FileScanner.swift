@@ -1,233 +1,283 @@
 import Foundation
 import os
+import Synchronization
 
-enum ScanEvent: Sendable {
-    case progress(fileCount: Int, byteCount: Int64, currentPath: String)
-    case completed(root: FileNode)
-    case error(String)
+/// Shared, thread-safe state for one scan run.
+final class ScanContext: Sendable {
+    let scope: ScanScope
+    let progress: ScanProgress
+
+    private struct DedupState {
+        var hardLinks = Set<UInt64>()
+        var cloneFamilies = Set<UInt64>()
+    }
+
+    private struct IssueLog {
+        var inaccessiblePaths: [String] = []
+        var inaccessibleCount = 0
+    }
+
+    private let dedup = Mutex(DedupState())
+    private let issues = Mutex(IssueLog())
+
+    init(scope: ScanScope, progress: ScanProgress) {
+        self.scope = scope
+        self.progress = progress
+    }
+
+    /// Returns true for the first sighting of a multiply-linked file; later links are skipped so the
+    /// file's bytes are counted once.
+    func claimHardLink(_ fileID: UInt64) -> Bool {
+        dedup.withLock { $0.hardLinks.insert(fileID).inserted }
+    }
+
+    /// Returns true for the first member of a pure-clone family, which is charged for the shared blocks.
+    func claimCloneFamily(_ cloneID: UInt64) -> Bool {
+        dedup.withLock { $0.cloneFamilies.insert(cloneID).inserted }
+    }
+
+    /// Pre-populates dedup state from an existing tree (incremental rescans).
+    func seed(hardLinks: Set<UInt64>, cloneFamilies: Set<UInt64>) {
+        dedup.withLock {
+            $0.hardLinks.formUnion(hardLinks)
+            $0.cloneFamilies.formUnion(cloneFamilies)
+        }
+    }
+
+    func recordInaccessible(_ path: String) {
+        progress.didFindInaccessibleDirectory()
+        issues.withLock {
+            $0.inaccessibleCount += 1
+            if $0.inaccessiblePaths.count < ScanReport.maxRecordedIssues {
+                $0.inaccessiblePaths.append(path)
+            }
+        }
+    }
+
+    var inaccessible: (paths: [String], count: Int) {
+        issues.withLock { ($0.inaccessiblePaths.sorted(), $0.inaccessibleCount) }
+    }
 }
 
+/// Walks directory trees in parallel and builds `FileNode` trees.
+///
+/// Each directory is read with a single `getattrlistbulk` pass, then its subdirectories are scanned as
+/// child tasks, so cancellation propagates through the whole walk. A directory's file descriptor is
+/// closed before its children are scanned, which bounds open descriptors by the pool width.
 struct FileScanner: Sendable {
-    let rootPath: String
+    private static let logger = Logger(subsystem: "SpaceLens", category: "Scanner")
 
-    func scan() -> AsyncStream<ScanEvent> {
-        let path = rootPath
-        return AsyncStream { continuation in
-            Task.detached {
-                await performParallelScan(rootPath: path, continuation: continuation)
-            }
+    let context: ScanContext
+
+    /// Scans the scope root and returns the finalized tree.
+    func scanRoot() async throws -> FileNode {
+        try Task.checkCancellation()
+        let rootPath = context.scope.rootPath
+        var rootStat = stat()
+        guard lstat(rootPath, &rootStat) == 0 else {
+            throw errno == ENOENT
+                ? ScanError.rootNotFound(rootPath)
+                : ScanError.rootUnreadable(path: rootPath, code: errno)
         }
-    }
-}
-
-// Thread-safe shared state for parallel scanning
-private final class ScanState: Sendable {
-    private let lock = OSAllocatedUnfairLock(initialState: State())
-    let rootDevice: dev_t
-
-    private struct State {
-        var fileCount: Int = 0
-        var byteCount: Int64 = 0
-        var seenInodes = Set<UInt64>()
-    }
-
-    init(rootDevice: dev_t) {
-        self.rootDevice = rootDevice
-    }
-
-    func addFile(inode: UInt64, size: Int64) -> (isNew: Bool, fileCount: Int, byteCount: Int64) {
-        lock.withLock { state in
-            // Dedup all inodes — catches hardlinks and firmlink duplicates
-            if state.seenInodes.contains(inode) {
-                return (false, state.fileCount, state.byteCount)
-            }
-            state.seenInodes.insert(inode)
-            state.fileCount += 1
-            state.byteCount += size
-            return (true, state.fileCount, state.byteCount)
-        }
-    }
-
-    func checkNewDirectory(inode: UInt64) -> Bool {
-        lock.withLock { state in
-            if state.seenInodes.contains(inode) { return false }
-            state.seenInodes.insert(inode)
-            return true
-        }
-    }
-
-    func currentCounts() -> (files: Int, bytes: Int64) {
-        lock.withLock { ($0.fileCount, $0.byteCount) }
-    }
-}
-
-private func performParallelScan(rootPath: String, continuation: AsyncStream<ScanEvent>.Continuation) async {
-    var rootStat = Darwin.stat()
-    guard lstat(rootPath, &rootStat) == 0 else {
-        continuation.yield(.error("Failed to stat root directory"))
-        continuation.finish()
-        return
-    }
-
-    let state = ScanState(rootDevice: rootStat.st_dev)
-
-    if let root = await scanDirectory(
-        atPath: rootPath,
-        name: rootPath,
-        state: state,
-        continuation: continuation
-    ) {
-        root.computeAggregates()
-        root.sortChildrenBySize()
-        let counts = state.currentCounts()
-        continuation.yield(.progress(
-            fileCount: counts.files,
-            byteCount: counts.bytes,
-            currentPath: rootPath
-        ))
-        continuation.yield(.completed(root: root))
-    } else {
-        continuation.yield(.error("Failed to scan directory"))
-    }
-    continuation.finish()
-}
-
-private func scanDirectory(
-    atPath path: String,
-    name: String,
-    state: ScanState,
-    continuation: AsyncStream<ScanEvent>.Continuation
-) async -> FileNode? {
-    var dirStat = Darwin.stat()
-    guard lstat(path, &dirStat) == 0 else { return nil }
-
-    // Skip directories we've already scanned (firmlinks create duplicates)
-    guard state.checkNewDirectory(inode: UInt64(dirStat.st_ino)) else { return nil }
-
-    let dirNode = FileNode(
-        inode: UInt64(dirStat.st_ino),
-        name: name,
-        isDirectory: true,
-        ownSize: Int64(dirStat.st_size),
-        allocatedSize: Int64(dirStat.st_blocks) * 512,
-        category: .other,
-        modificationDate: Date(timeIntervalSince1970: TimeInterval(dirStat.st_mtimespec.tv_sec))
-    )
-
-    guard let dir = opendir(path) else { return dirNode }
-    let dirFD = dirfd(dir)
-
-    var fileChildren: [FileNode] = []
-    var subdirPaths: [(path: String, name: String)] = []
-
-    while let entry = readdir(dir) {
-        // Quick skip . and .. without String conversion
-        if entry.pointee.d_name.0 == 0x2E {
-            let b2 = entry.pointee.d_name.1
-            if b2 == 0 { continue }
-            if b2 == 0x2E && entry.pointee.d_name.2 == 0 { continue }
+        guard rootStat.st_mode & S_IFMT == S_IFDIR else {
+            throw ScanError.rootNotDirectory(rootPath)
         }
 
-        let d_type = entry.pointee.d_type
-        // Skip symlinks, sockets, etc. early via d_type
-        if d_type != DT_DIR && d_type != DT_REG && d_type != DT_UNKNOWN { continue }
+        let root = FileNode(
+            name: rootPath,
+            fileID: UInt64(rootStat.st_ino),
+            attributes: .directory,
+            modificationTime: Int64(rootStat.st_mtimespec.tv_sec)
+        )
 
-        // Use fstatat with dir FD — avoids building full path for stat
-        var childStat = Darwin.stat()
-        var d_name = entry.pointee.d_name
-        let statOK = withUnsafeBytes(of: &d_name) { buf in
-            fstatat(dirFD, buf.baseAddress!.assumingMemoryBound(to: CChar.self),
-                    &childStat, AT_SYMLINK_NOFOLLOW) == 0
+        context.progress.setPhase(.scanning)
+        let listing: DirectoryListing
+        do {
+            listing = try listDirectory(atPath: rootPath)
+        } catch {
+            throw ScanError.rootUnreadable(path: rootPath, code: error.code)
         }
-        guard statOK else { continue }
+        root.setChildren(listing.files + listing.subdirectories.map(\.node))
+        try await scanSubdirectories(listing.subdirectories)
 
-        // Skip cross-device entries (equivalent to FTS_XDEV)
-        if childStat.st_dev != state.rootDevice { continue }
-
-        let mode = childStat.st_mode & S_IFMT
-
-        let entryName = withUnsafeBytes(of: &d_name) { buf in
-            String(cString: buf.baseAddress!.assumingMemoryBound(to: CChar.self))
-        }
-
-        if mode == S_IFDIR {
-            let childPath = path.last == "/" ? path + entryName : path + "/" + entryName
-            subdirPaths.append((childPath, entryName))
-        } else if mode == S_IFREG {
-            let fileSize = Int64(childStat.st_size)
-            let inode = UInt64(childStat.st_ino)
-            let result = state.addFile(inode: inode, size: fileSize)
-            guard result.isNew else { continue }
-
-            let ext = fastPathExtension(of: entryName)
-            let category = FileExtensionMap.category(for: ext)
-
-            fileChildren.append(FileNode(
-                inode: inode,
-                name: entryName,
-                isDirectory: false,
-                ownSize: fileSize,
-                allocatedSize: Int64(childStat.st_blocks) * 512,
-                category: category,
-                modificationDate: Date(timeIntervalSince1970: TimeInterval(childStat.st_mtimespec.tv_sec))
-            ))
-
-            if result.fileCount % 10000 == 0 {
-                continuation.yield(.progress(
-                    fileCount: result.fileCount,
-                    byteCount: result.byteCount,
-                    currentPath: path + "/" + entryName
-                ))
-            }
-        }
+        context.progress.setPhase(.finalizing)
+        root.finalizeTree()
+        return root
     }
 
-    // Close directory before spawning parallel work to limit open FDs
-    closedir(dir)
-
-    for file in fileChildren {
-        dirNode.addChild(file)
+    /// Recursively scans `path` into `node`, replacing its children. Unreadable directories are
+    /// recorded and left empty.
+    func scanDirectory(atPath path: String, into node: FileNode) async throws {
+        try Task.checkCancellation()
+        let listing: DirectoryListing
+        do {
+            listing = try listDirectory(atPath: path)
+        } catch {
+            handleReadError(error)
+            return
+        }
+        node.setChildren(listing.files + listing.subdirectories.map(\.node))
+        try await scanSubdirectories(listing.subdirectories)
     }
 
-    // Scan subdirectories in parallel using structured concurrency
-    if subdirPaths.count == 1 {
-        // Single subdir — skip TaskGroup overhead
-        if let child = await scanDirectory(
-            atPath: subdirPaths[0].path,
-            name: subdirPaths[0].name,
-            state: state,
-            continuation: continuation
-        ) {
-            dirNode.addChild(child)
-        }
-    } else if !subdirPaths.isEmpty {
-        await withTaskGroup(of: FileNode?.self) { group in
-            for subdir in subdirPaths {
-                group.addTask {
-                    await scanDirectory(
-                        atPath: subdir.path,
-                        name: subdir.name,
-                        state: state,
-                        continuation: continuation
-                    )
+    func scanSubdirectories(_ subdirectories: [(node: FileNode, path: String)]) async throws {
+        switch subdirectories.count {
+        case 0:
+            return
+        case 1:
+            try await scanDirectory(atPath: subdirectories[0].path, into: subdirectories[0].node)
+        default:
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for subdirectory in subdirectories {
+                    group.addTask {
+                        try await scanDirectory(atPath: subdirectory.path, into: subdirectory.node)
+                    }
                 }
+                try await group.waitForAll()
             }
-            for await childNode in group {
-                if let child = childNode {
-                    dirNode.addChild(child)
+        }
+    }
+
+    func handleReadError(_ error: DirectoryReadError) {
+        // Vanished mid-scan: not an issue worth reporting.
+        if error.isNotFound { return }
+        // Dataless (not yet downloaded) cloud directory; materialization is disabled during scans.
+        if error.code == EDEADLK { return }
+        Self.logger.debug("Cannot read \(error.path, privacy: .private): errno \(error.code)")
+        context.recordInaccessible(error.path)
+    }
+
+    // MARK: - Listing
+
+    struct DirectoryListing {
+        var files: [FileNode] = []
+        /// Subdirectories to descend into, with their not-yet-populated nodes.
+        var subdirectories: [(node: FileNode, path: String)] = []
+    }
+
+    /// Reads one directory level. Files become finished nodes; subdirectories become empty nodes.
+    func listDirectory(atPath path: String) throws(DirectoryReadError) -> DirectoryListing {
+        let scope = context.scope
+        let entries = try DirectoryReader.readEntries(atPath: path)
+
+        var listing = DirectoryListing()
+        var logicalBytes: Int64 = 0
+        var physicalBytes: Int64 = 0
+
+        for entry in entries where scope.includes(entry) {
+            switch entry.kind {
+            case .directory:
+                let childPath = ScanScope.childPath(path, entry.name)
+                guard scope.shouldDescend(into: entry, atPath: childPath) else { continue }
+                listing.subdirectories.append((makeDirectoryNode(entry), childPath))
+            case .regularFile, .symlink:
+                guard let node = makeFileNode(entry) else { continue }
+                logicalBytes += node.ownSize
+                physicalBytes += node.allocatedSize
+                listing.files.append(node)
+            case .other:
+                // Sockets, FIFOs and device nodes occupy no data blocks.
+                continue
+            }
+        }
+
+        context.progress.didReadDirectory(
+            path: path,
+            files: listing.files.count,
+            logical: logicalBytes,
+            physical: physicalBytes
+        )
+        return listing
+    }
+
+    func makeDirectoryNode(_ entry: DirectoryEntry) -> FileNode {
+        var attributes: FileNode.Attributes = .directory
+        if entry.isHidden { attributes.insert(.hidden) }
+        return FileNode(
+            name: entry.name,
+            fileID: entry.fileID,
+            attributes: attributes,
+            modificationTime: entry.modificationTime
+        )
+    }
+
+    /// Builds a leaf node, applying hard-link and clone de-duplication. Returns nil for repeated hard links.
+    func makeFileNode(_ entry: DirectoryEntry) -> FileNode? {
+        var attributes: FileNode.Attributes = []
+        if entry.kind == .regularFile && entry.linkCount > 1 {
+            guard context.claimHardLink(entry.fileID) else { return nil }
+            attributes.insert(.hardLinked)
+        }
+        if entry.kind == .symlink { attributes.insert(.symlink) }
+        if entry.isHidden { attributes.insert(.hidden) }
+        if entry.isSparse { attributes.insert(.sparse) }
+        if entry.isCompressed { attributes.insert(.compressed) }
+        if entry.isPurgeable { attributes.insert(.purgeable) }
+
+        var physicalSize = entry.allocatedSize
+        var cloneID: UInt64 = 0
+        if entry.mayShareBlocks {
+            attributes.insert(.clone)
+            // Pure clones share every block, so the family's data is charged once, to the first member
+            // seen. Partial clones cannot be matched to their family and are charged in full, which
+            // matches Finder's "size on disk".
+            if entry.sharesAllBlocks, let familyID = entry.cloneID {
+                cloneID = familyID
+                if context.claimCloneFamily(familyID) {
+                    attributes.insert(.cloneOwner)
+                } else {
+                    physicalSize = entry.privateSize ?? 0
                 }
             }
         }
+
+        let category: FileCategory = entry.kind == .symlink
+            ? .other
+            : FileExtensionMap.category(for: Self.pathExtension(of: entry.name))
+
+        return FileNode(
+            name: entry.name,
+            fileID: entry.fileID,
+            attributes: attributes,
+            category: category,
+            ownSize: entry.logicalSize,
+            allocatedSize: physicalSize,
+            cloneID: cloneID,
+            modificationTime: entry.modificationTime
+        )
     }
 
-    return dirNode
+    private static func pathExtension(of name: String) -> String {
+        guard let dotIndex = name.lastIndex(of: "."), dotIndex != name.startIndex else { return "" }
+        return String(name[name.index(after: dotIndex)...])
+    }
 }
 
-// Fast extension extraction without NSString bridging
-@inline(__always)
-private func fastPathExtension(of name: String) -> String {
-    guard let dotIndex = name.lastIndex(of: ".") else { return "" }
-    let afterDot = name.index(after: dotIndex)
-    guard afterDot < name.endIndex else { return "" }
-    return String(name[afterDot...])
+/// Disables materialization of dataless (cloud placeholder) files and directories for the process
+/// while at least one scan runs, so scanning never triggers iCloud / File Provider downloads.
+enum DatalessMaterializationPolicy {
+    private static let activeScans = Mutex<(count: Int, previous: Int32)>((0, 0))
+
+    static func withMaterializationDisabled<T>(_ body: () async throws -> T) async rethrows -> T {
+        activeScans.withLock { state in
+            if state.count == 0 {
+                state.previous = getiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS)
+                setiopolicy_np(
+                    IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES,
+                    IOPOL_SCOPE_PROCESS,
+                    IOPOL_MATERIALIZE_DATALESS_FILES_OFF
+                )
+            }
+            state.count += 1
+        }
+        defer {
+            activeScans.withLock { state in
+                state.count -= 1
+                if state.count == 0 && state.previous >= 0 {
+                    setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS, state.previous)
+                }
+            }
+        }
+        return try await body()
+    }
 }

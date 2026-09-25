@@ -21,6 +21,8 @@ struct TreemapItem: Identifiable, Sendable {
     let rect: TreemapRect
     let depth: Int
     let color: CGColor
+    /// True when children are laid out on top of this item, hiding everything but its border.
+    var hasChildren: Bool = false
 }
 
 struct TreemapLayoutEngine: Sendable {
@@ -59,7 +61,7 @@ struct TreemapLayoutEngine: Sendable {
         items: inout [TreemapItem],
         nextID: inout Int
     ) {
-        guard bounds.area >= minPixelArea else { return }
+        guard bounds.area >= minPixelArea, !Task.isCancelled else { return }
 
         // Leaf node (file or empty/childless directory)
         if !node.isDirectory || node.children.isEmpty || depth >= maxDepth {
@@ -95,7 +97,8 @@ struct TreemapLayoutEngine: Sendable {
             node: node,
             rect: bounds,
             depth: depth,
-            color: colorForNode(node, depth: depth)
+            color: colorForNode(node, depth: depth),
+            hasChildren: true
         ))
 
         let totalSize = Double(children.reduce(0) { $0 + $1.size(for: sizeMetric) })
