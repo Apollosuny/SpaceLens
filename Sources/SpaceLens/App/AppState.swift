@@ -1,85 +1,96 @@
 import SwiftUI
 
-enum ScanStatus: Equatable {
-    case idle
-    case scanning(ScanProgressSnapshot)
-    case completed
-    case error(String)
-}
-
 enum SizeMetric: String, CaseIterable, Sendable {
     case fileSize = "Logical Size"
     case allocatedSize = "Physical Size"
 }
 
+/// What treemap and sunburst colors encode.
+enum ColorMode: String, CaseIterable, Sendable {
+    /// Each top-level folder has its own hue, carried through its subtree.
+    case folder
+    /// Files are colored by kind (`FileCategory`).
+    case kind
+}
+
+enum ChartStyle: String, CaseIterable, Sendable {
+    case treemap
+    case sunburst
+}
+
+/// App-wide state: which screen is shown, the current results and scan progress.
+///
+/// Views observe individual properties, so keep hot values apart: `scanProgress` changes 10 times a second
+/// and only the progress view reads it.
 @Observable
 @MainActor
 final class AppState {
-    var scanStatus: ScanStatus = .idle
-    var rootNode: FileNode?
-    var treemapRoot: FileNode?
-    var selectedNode: FileNode?
-    var breadcrumbs: [FileNode] = []
+    enum Screen: Equatable {
+        case welcome
+        case scanning
+        case results
+        case failed(message: String)
+    }
+
+    private(set) var screen: Screen = .welcome
+    /// Where a scan was started from; cancelling or dismissing its error returns there.
+    private var screenBeforeScan: Screen = .welcome
+    /// The most recent completed scan. Kept while another scan runs, so cancelling returns to it.
+    private(set) var results: ResultsModel?
+    /// Sampled progress of the running scan.
+    var scanProgress: ScanProgressSnapshot?
     var sizeMetric: SizeMetric = .fileSize
-    var showInspector: Bool = true
-    /// Report of the scan currently displayed.
-    var lastReport: ScanReport?
+    var colorMode: ColorMode = .folder
+    var chartStyle: ChartStyle = .treemap
+    var showInspector = true
     var history: [ScanHistoryEntry] = []
 
-    var isScanning: Bool {
-        if case .scanning = scanStatus { return true }
-        return false
+    var isScanning: Bool { screen == .scanning }
+
+    func scanStarted(progress: ScanProgressSnapshot) {
+        if screen != .scanning { screenBeforeScan = screen }
+        scanProgress = progress
+        screen = .scanning
     }
 
-    var hasData: Bool {
-        rootNode != nil
-    }
-
-    func drillDown(to node: FileNode) {
-        guard node.isDirectory else { return }
-        withAnimation(.spring(duration: 0.3)) {
-            treemapRoot = node
-            selectedNode = node
-            rebuildBreadcrumbs()
+    func scanFinished(root: FileNode, report: ScanReport) {
+        if let retired = results {
+            Self.releaseInBackground(retired.root)
         }
+        results = ResultsModel(root: root, report: report)
+        scanProgress = nil
+        screen = .results
     }
 
-    func navigateTo(breadcrumb node: FileNode) {
-        withAnimation(.spring(duration: 0.3)) {
-            treemapRoot = node
-            selectedNode = node
-            rebuildBreadcrumbs()
-        }
+    func scanCancelled() {
+        scanProgress = nil
+        screen = screenAfterAbandonedScan
     }
 
-    func navigateUp() {
-        guard let current = treemapRoot, let parent = current.parent else { return }
-        withAnimation(.spring(duration: 0.3)) {
-            treemapRoot = parent
-            selectedNode = parent
-            rebuildBreadcrumbs()
-        }
+    func scanFailed(message: String) {
+        scanProgress = nil
+        screen = .failed(message: message)
     }
 
-    func setScanCompleted(root: FileNode, report: ScanReport) {
-        rootNode = root
-        treemapRoot = root
-        selectedNode = root
-        lastReport = report
-        scanStatus = .completed
-        rebuildBreadcrumbs()
+    /// Leaves the current screen for the welcome screen. Results stay loaded.
+    func showWelcome() {
+        guard !isScanning else { return }
+        screen = .welcome
     }
 
-    func reset() {
-        if let retiredRoot = rootNode {
-            Self.releaseInBackground(retiredRoot)
-        }
-        scanStatus = .idle
-        rootNode = nil
-        treemapRoot = nil
-        selectedNode = nil
-        breadcrumbs = []
-        lastReport = nil
+    func showResults() {
+        guard results != nil, !isScanning else { return }
+        screen = .results
+    }
+
+    func dismissError() {
+        screen = screenAfterAbandonedScan
+    }
+
+    /// Results are only returned to when the scan was started from them (a rescan); a scan started from
+    /// the welcome screen goes back there, which still offers "Back to Results".
+    private var screenAfterAbandonedScan: Screen {
+        screenBeforeScan == .results && results != nil ? .results : .welcome
     }
 
     /// Deallocating a tree of millions of nodes takes hundreds of milliseconds. Keep the root alive on a
@@ -90,15 +101,5 @@ final class AppState {
             try? await Task.sleep(for: .seconds(2))
             withExtendedLifetime(root) {}
         }
-    }
-
-    private func rebuildBreadcrumbs() {
-        var crumbs: [FileNode] = []
-        var node = treemapRoot
-        while let current = node {
-            crumbs.insert(current, at: 0)
-            node = current.parent
-        }
-        breadcrumbs = crumbs
     }
 }

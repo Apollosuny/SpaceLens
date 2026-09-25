@@ -1,177 +1,239 @@
 import SwiftUI
 
 struct ContentView: View {
+    let coordinator: ScanCoordinator
+
     @Environment(AppState.self) private var appState
-    @State private var coordinator: ScanCoordinator?
     @AppStorage("includeHiddenFiles") private var includeHiddenFiles = true
-    @FocusedValue(\.zoomInAction) private var zoomIn
-    @FocusedValue(\.zoomOutAction) private var zoomOut
-    @FocusedValue(\.resetZoomAction) private var resetZoom
+    /// Plain state bindings, only reassigned when the screen changes: a binding whose getter disagrees with
+    /// what AppKit just set makes the split view re-lay out the window endlessly.
+    @State private var sidebarVisibility: NavigationSplitViewVisibility = .detailOnly
+    /// The user's sidebar choice on the results screen, restored when returning to it.
+    @State private var resultsSidebarVisibility: NavigationSplitViewVisibility = .all
+    @State private var inspectorPresented = false
 
     var body: some View {
         @Bindable var state = appState
 
-        NavigationSplitView {
-            if let root = appState.rootNode {
-                DirectoryTreeView(root: root, selectedNode: $state.selectedNode, sizeMetric: appState.sizeMetric)
-                    .navigationSplitViewColumnWidth(min: 200, ideal: 260, max: 400)
-            } else {
-                Text("No data")
-                    .foregroundStyle(.secondary)
-                    .frame(maxHeight: .infinity)
-            }
-        } detail: {
-            ZStack {
-                switch appState.scanStatus {
-                case .idle:
-                    WelcomeView(
-                        history: appState.history,
-                        includeHiddenFiles: $includeHiddenFiles,
-                        onVolumeSelected: { path in
-                            coordinator?.startScan(path: path, options: ScanOptions(includeHiddenFiles: includeHiddenFiles))
-                        },
-                        onClearHistory: { coordinator?.clearHistory() }
-                    )
-                    .transition(.opacity)
-
-                case let .scanning(progress):
-                    ScanProgressView(progress: progress) {
-                        coordinator?.cancel()
-                        appState.scanStatus = .idle
-                    }
-
-                case .completed:
-                    if let treemapRoot = appState.treemapRoot {
-                        VStack(spacing: 0) {
-                            if let report = appState.lastReport, report.inaccessibleCount > 0 {
-                                InaccessibleFoldersBanner(report: report)
-                            }
-
-                            // Breadcrumb bar
-                            BreadcrumbBar(
-                                breadcrumbs: appState.breadcrumbs,
-                                onNavigate: { node in
-                                    appState.navigateTo(breadcrumb: node)
-                                }
-                            )
-
-                            // Treemap
-                            TreemapView(
-                                root: treemapRoot,
-                                onSelect: { node in
-                                    appState.selectedNode = node
-                                },
-                                onDrillDown: { node in
-                                    appState.drillDown(to: node)
-                                },
-                                sizeMetric: appState.sizeMetric
-                            )
-                        }
-                    }
-
-                case let .error(message):
-                    VStack(spacing: 12) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .font(.largeTitle)
-                            .foregroundStyle(.red)
-                        Text("Scan Error")
-                            .font(.title2.bold())
-                        Text(message)
-                            .foregroundStyle(.secondary)
-                        Button("Try Again") {
-                            appState.reset()
-                        }
-                    }
+        NavigationSplitView(columnVisibility: $sidebarVisibility) {
+            Group {
+                if let results = appState.results, appState.screen == .results {
+                    DirectoryTreeView(results: results, sizeMetric: appState.sizeMetric, colorMode: appState.colorMode)
+                } else {
+                    ContentUnavailableView("No Scan", systemImage: "internaldrive", description: Text("Scan a disk or folder to browse its folders here."))
                 }
             }
+            .navigationSplitViewColumnWidth(min: 200, ideal: 260, max: 400)
+        } detail: {
+            detail
         }
-        .inspector(isPresented: $state.showInspector) {
-            if let selected = appState.selectedNode {
-                DetailPanelView(node: selected)
-                    .inspectorColumnWidth(min: 250, ideal: 300, max: 400)
-            } else {
-                Text("Select an item to view details")
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .inspector(isPresented: $inspectorPresented) {
+            Group {
+                if let results = appState.results {
+                    InspectorColumn(results: results, sizeMetric: appState.sizeMetric)
+                }
             }
+            .inspectorColumnWidth(min: 250, ideal: 300, max: 400)
         }
         .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                Menu {
-                    Button("Full Rescan") {
-                        coordinator?.rescan(mode: .full)
+            if appState.screen == .results, let results = appState.results {
+                ToolbarItem(placement: .navigation) {
+                    BackButton(results: results)
+                }
+
+                ToolbarItem(placement: .primaryAction) {
+                    Picker("Size", selection: $state.sizeMetric) {
+                        Text("Logical").tag(SizeMetric.fileSize)
+                        Text("Physical").tag(SizeMetric.allocatedSize)
                     }
-                } label: {
-                    Label("Rescan", systemImage: "arrow.clockwise")
-                } primaryAction: {
-                    coordinator?.rescan(mode: .automatic)
-                }
-                .help("Rescan, re-reading only folders changed since the last scan")
-                .disabled(appState.lastReport == nil || appState.isScanning)
-
-                Button {
-                    selectAndScan()
-                } label: {
-                    Label("Scan Drive", systemImage: "internaldrive.fill")
+                    .pickerStyle(.segmented)
+                    .help("Logical size is what files contain; physical size is the disk space they occupy")
                 }
 
-                SizeMetricPicker(sizeMetric: $state.sizeMetric) {
-                    if appState.scanStatus == .idle, appState.rootNode != nil {
-                        appState.scanStatus = .completed
+                ToolbarItem(placement: .primaryAction) {
+                    Picker("View", selection: $state.chartStyle) {
+                        Label("Treemap", systemImage: "square.grid.2x2").tag(ChartStyle.treemap)
+                        Label("Sunburst", systemImage: "chart.pie").tag(ChartStyle.sunburst)
                     }
+                    .pickerStyle(.segmented)
+                    .labelStyle(.iconOnly)
+                    .help("Show folders as a treemap or as rings")
                 }
 
-                Button {
-                    zoomIn?()
-                } label: {
-                    Label("Zoom In", systemImage: "plus.magnifyingglass")
-                }
-                .disabled(zoomIn == nil)
-
-                Button {
-                    zoomOut?()
-                } label: {
-                    Label("Zoom Out", systemImage: "minus.magnifyingglass")
-                }
-                .disabled(zoomOut == nil)
-
-                Button {
-                    resetZoom?()
-                } label: {
-                    Label("Reset Zoom", systemImage: "1.magnifyingglass")
-                }
-                .disabled(resetZoom == nil)
-
-                Button {
-                    appState.showInspector.toggle()
-                } label: {
-                    Label("Inspector", systemImage: "sidebar.right")
-                }
-            }
-
-            ToolbarItem(placement: .navigation) {
-                if appState.treemapRoot?.parent != nil {
-                    Button {
-                        appState.navigateUp()
+                ToolbarItem(placement: .primaryAction) {
+                    Menu {
+                        Picker("Color By", selection: $state.colorMode) {
+                            Text("Folder").tag(ColorMode.folder)
+                            Text("Kind").tag(ColorMode.kind)
+                        }
+                        .pickerStyle(.inline)
                     } label: {
-                        Label("Back", systemImage: "chevron.left")
+                        Label("Colors", systemImage: "paintpalette")
                     }
+                    .help("Color by top-level folder or by file kind")
+                }
+
+                if appState.chartStyle == .treemap {
+                    ToolbarItem(placement: .primaryAction) {
+                        ZoomControls(viewport: results.viewport)
+                    }
+                }
+
+                ToolbarItemGroup(placement: .primaryAction) {
+                    Menu {
+                        Button("Full Rescan") {
+                            coordinator.rescan(mode: .full)
+                        }
+                    } label: {
+                        Label("Rescan", systemImage: "arrow.clockwise")
+                    } primaryAction: {
+                        coordinator.rescan(mode: .automatic)
+                    }
+                    .help("Rescan, re-reading only folders changed since the last scan")
+
+                    Button {
+                        appState.showWelcome()
+                    } label: {
+                        Label("New Scan", systemImage: "internaldrive")
+                    }
+                    .help("Choose another disk or folder")
+                }
+
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        inspectorPresented.toggle()
+                    } label: {
+                        Label("Inspector", systemImage: "sidebar.right")
+                    }
+                    .help("Show or hide the inspector")
                 }
             }
         }
-        .onAppear {
-            if coordinator == nil {
-                coordinator = ScanCoordinator(appState: appState)
-            }
+        .onChange(of: appState.screen, initial: true) { _, screen in
+            updateColumns(for: screen)
         }
-        .focusedSceneValue(\.scanAction, {
-            selectAndScan()
-        })
+        .onChange(of: sidebarVisibility) { _, visibility in
+            if appState.screen == .results { resultsSidebarVisibility = visibility }
+        }
+        .onChange(of: inspectorPresented) { _, isPresented in
+            if appState.screen == .results { appState.showInspector = isPresented }
+        }
     }
 
-    private func selectAndScan() {
-        coordinator?.cancel()
-        appState.scanStatus = .idle
+    @ViewBuilder
+    private var detail: some View {
+        switch appState.screen {
+        case .welcome:
+            WelcomeView(
+                history: appState.history,
+                includeHiddenFiles: $includeHiddenFiles,
+                onVolumeSelected: { path in
+                    coordinator.startScan(path: path, options: ScanOptions(includeHiddenFiles: includeHiddenFiles))
+                },
+                onClearHistory: { coordinator.clearHistory() },
+                onReturnToResults: appState.results == nil ? nil : { appState.showResults() }
+            )
+            .navigationTitle("SpaceLens")
+
+        case .scanning:
+            ScanProgressView(onCancel: { coordinator.cancel() })
+                .navigationTitle("SpaceLens")
+
+        case .results:
+            if let results = appState.results {
+                ResultsView(
+                    results: results,
+                    sizeMetric: appState.sizeMetric,
+                    colorMode: appState.colorMode,
+                    chartStyle: appState.chartStyle
+                )
+            }
+
+        case let .failed(message):
+            ContentUnavailableView {
+                Label("Scan Failed", systemImage: "exclamationmark.triangle")
+            } description: {
+                Text(message)
+            } actions: {
+                Button("OK") {
+                    appState.dismissError()
+                }
+                .prominentGlassButtonStyle()
+            }
+            .navigationTitle("SpaceLens")
+        }
+    }
+
+    /// The sidebar and inspector only belong to the results screen; elsewhere they start hidden but the
+    /// user can still open them.
+    private func updateColumns(for screen: AppState.Screen) {
+        let showsResults = screen == .results
+        sidebarVisibility = showsResults ? resultsSidebarVisibility : .detailOnly
+        inspectorPresented = showsResults && appState.showInspector
+    }
+}
+
+// MARK: - Toolbar Controls
+
+/// Separate views so only they re-render when navigation or zoom changes.
+private struct BackButton: View {
+    let results: ResultsModel
+
+    var body: some View {
+        Button {
+            results.navigateUp()
+        } label: {
+            Label("Back", systemImage: "chevron.left")
+        }
+        .help("Show the enclosing folder")
+        .disabled(!results.canNavigateUp)
+    }
+}
+
+private struct ZoomControls: View {
+    let viewport: TreemapViewport
+
+    var body: some View {
+        ControlGroup {
+            Button {
+                viewport.zoomOut()
+            } label: {
+                Label("Zoom Out", systemImage: "minus.magnifyingglass")
+            }
+            .keyboardShortcut("-")
+            .disabled(!viewport.canZoomOut)
+
+            Button {
+                viewport.reset()
+            } label: {
+                Label("Actual Size", systemImage: "1.magnifyingglass")
+            }
+            .keyboardShortcut("0")
+            .disabled(!viewport.canZoomOut)
+
+            Button {
+                viewport.zoomIn()
+            } label: {
+                Label("Zoom In", systemImage: "plus.magnifyingglass")
+            }
+            .keyboardShortcut("+")
+            .disabled(!viewport.canZoomIn)
+        }
+    }
+}
+
+// MARK: - Inspector
+
+private struct InspectorColumn: View {
+    let results: ResultsModel
+    let sizeMetric: SizeMetric
+
+    var body: some View {
+        if let selected = results.selection {
+            DetailPanelView(node: selected, results: results, sizeMetric: sizeMetric)
+        } else {
+            ContentUnavailableView("No Selection", systemImage: "square.dashed", description: Text("Select a folder or file to see its details."))
+        }
     }
 }
 
@@ -190,7 +252,6 @@ struct InaccessibleFoldersBanner: View {
             Image(systemName: "lock.fill")
                 .foregroundStyle(.orange)
             Text("\(report.inaccessibleCount.formatted()) folders couldn’t be read, so sizes may be understated.")
-                .font(.callout)
             Spacer()
             Button("Show") { showsDetails.toggle() }
                 .popover(isPresented: $showsDetails, arrowEdge: .bottom) {
@@ -202,10 +263,12 @@ struct InaccessibleFoldersBanner: View {
                 }
             }
         }
+        .font(.callout)
         .controlSize(.small)
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
-        .background(.orange.opacity(0.12))
+        .background(.orange.opacity(0.1))
+        .overlay(alignment: .bottom) { Divider() }
     }
 }
 
@@ -235,103 +298,68 @@ private struct InaccessibleFoldersList: View {
     }
 }
 
-// MARK: - Size Metric Picker
-
-struct SizeMetricPicker: View {
-    @Binding var sizeMetric: SizeMetric
-    var onTap: () -> Void
-
-    var body: some View {
-        HStack(spacing: 0) {
-            ForEach(SizeMetric.allCases, id: \.self) { metric in
-                Button {
-                    sizeMetric = metric
-                    onTap()
-                } label: {
-                    Text(metric.rawValue)
-                        .font(.body)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 4)
-                }
-                .buttonStyle(.plain)
-                .background(sizeMetric == metric ? Color.accentColor.opacity(0.2) : Color.clear)
-            }
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3)))
-    }
-}
-
 // MARK: - Breadcrumb Bar
 
 struct BreadcrumbBar: View {
     let breadcrumbs: [FileNode]
+    let sizeMetric: SizeMetric
     let onNavigate: (FileNode) -> Void
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 4) {
-                ForEach(Array(breadcrumbs.enumerated()), id: \.element.id) { index, node in
-                    if index > 0 {
-                        Image(systemName: "chevron.right")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
+        HStack(spacing: 12) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 2) {
+                    ForEach(Array(breadcrumbs.enumerated()), id: \.element.id) { index, node in
+                        if index > 0 {
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(.tertiary)
+                        }
+                        let isCurrent = index == breadcrumbs.count - 1
+                        Button {
+                            onNavigate(node)
+                        } label: {
+                            Label {
+                                Text(node.displayName)
+                                    .fontWeight(isCurrent ? .semibold : .regular)
+                                    .lineLimit(1)
+                            } icon: {
+                                if index == 0 {
+                                    Image(systemName: node.name == "/" ? "internaldrive" : "folder")
+                                } else if isCurrent {
+                                    Image(systemName: "folder.fill")
+                                        .foregroundStyle(.tint)
+                                }
+                            }
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(isCurrent ? .primary : .secondary)
+                        .disabled(isCurrent)
                     }
-
-                    Button {
-                        onNavigate(node)
-                    } label: {
-                        Text(node.name)
-                            .font(.caption)
-                            .lineLimit(1)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(index == breadcrumbs.count - 1 ? .primary : .secondary)
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
+
+            if let current = breadcrumbs.last {
+                Text("\(current.fileCount.formatted()) files · \(current.directoryCount.formatted()) folders")
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .fixedSize()
+            }
         }
-        .background(.bar)
+        .font(.caption)
+        .padding(.horizontal, 10)
+        .frame(minWidth: 0, maxWidth: .infinity, minHeight: 32, maxHeight: 32)
+        .overlay(alignment: .bottom) { Divider() }
     }
 }
 
-// MARK: - Focused Value for Menu Commands
-
-struct ScanActionKey: FocusedValueKey {
-    typealias Value = () -> Void
-}
-
-struct ZoomInActionKey: FocusedValueKey {
-    typealias Value = () -> Void
-}
-
-struct ZoomOutActionKey: FocusedValueKey {
-    typealias Value = () -> Void
-}
-
-struct ResetZoomActionKey: FocusedValueKey {
-    typealias Value = () -> Void
-}
-
-extension FocusedValues {
-    var scanAction: (() -> Void)? {
-        get { self[ScanActionKey.self] }
-        set { self[ScanActionKey.self] = newValue }
-    }
-
-    var zoomInAction: (() -> Void)? {
-        get { self[ZoomInActionKey.self] }
-        set { self[ZoomInActionKey.self] = newValue }
-    }
-
-    var zoomOutAction: (() -> Void)? {
-        get { self[ZoomOutActionKey.self] }
-        set { self[ZoomOutActionKey.self] = newValue }
-    }
-
-    var resetZoomAction: (() -> Void)? {
-        get { self[ResetZoomActionKey.self] }
-        set { self[ResetZoomActionKey.self] = newValue }
+extension FileNode {
+    /// Name for display: a scan root's name is its absolute path, so show the volume or folder name instead.
+    var displayName: String {
+        guard parent == nil else { return name }
+        return FileManager.default.displayName(atPath: name)
     }
 }

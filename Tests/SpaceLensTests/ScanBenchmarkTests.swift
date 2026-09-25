@@ -34,38 +34,25 @@ struct ScanBenchmarkTests {
                 .apply(ChangeSet(directories: [path]), to: try #require(decoded))
         }
 
-        let bounds = TreemapRect(x: 0, y: 0, width: 1400, height: 900)
-        var items: [TreemapItem] = []
+        let viewSize = CGSize(width: 1400, height: 900)
+        var layout = TreemapLayout(items: [], size: viewSize)
         let layoutTime = clock.measure {
-            items = TreemapLayoutEngine().layout(root: tree, in: bounds, sizeMetric: .allocatedSize)
+            layout = TreemapLayoutEngine().makeLayout(root: tree, size: viewSize, sizeMetric: .allocatedSize)
         }
-        let hitTester = TreemapHitTester(items: items)
+        let items = layout.items
         let hitTestTime = clock.measure {
             for step in 0..<100 {
-                _ = hitTester.itemAt(point: CGPoint(x: Double(step) * 14, y: Double(step) * 9))
+                _ = layout.item(at: CGPoint(x: Double(step) * 14, y: Double(step) * 9))
             }
         }
 
-        let drawnItems = items
-        func measureDraw(_ drawItems: [TreemapItem], labels: Bool) async -> Duration {
-            await MainActor.run {
-                // Best of several runs; each needs a fresh renderer because ImageRenderer caches its image.
-                (0..<5).map { _ in
-                    let renderer = ImageRenderer(content: Canvas { context, size in
-                        TreemapRenderer(items: drawItems, selectedItemID: nil, zoomScale: 1,
-                                        panOffset: .zero, showLabels: labels, sizeMetric: .allocatedSize)
-                            .draw(in: &context, size: size)
-                    }.frame(width: 1400, height: 900))
-                    return clock.measure { _ = renderer.cgImage }
-                }.min()!
-            }
-        }
-        let emptyDrawTime = await measureDraw([], labels: false)
-        let noLabelDrawTime = await measureDraw(drawnItems, labels: false)
-        let drawTime = await measureDraw(drawnItems, labels: true)
+        let rasterizer = TreemapRasterizer(colorScheme: .light, sizeMetric: .allocatedSize, scale: 2)
+        let drawTime = (0..<5).map { _ in
+            clock.measure { _ = rasterizer.render(layout, transform: TreemapTransform()) }
+        }.min()!
 
         print("""
-          treemap draw (1 frame): \(drawTime), without labels \(noLabelDrawTime), empty \(emptyDrawTime)
+          treemap rasterize (@2x): \(drawTime)
           treemap layout: \(layoutTime) → \(items.count) items; 100 hit tests: \(hitTestTime)
         [benchmark] \(path)
           files: \(tree.fileCount)  directories: \(tree.directoryCount)  skipped: \(context!.inaccessible.count)
