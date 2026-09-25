@@ -19,17 +19,16 @@ final class ScanCoordinator {
     }
 
     func startScan(path: String, options: ScanOptions, mode: ScanMode = .automatic) {
-        cancel()
-        appState.reset()
+        cancelRunningScan()
 
         let progress = ScanProgress(estimatedTotalBytes: ScanScope.estimatedUsedBytes(forVolumeRoot: path))
-        appState.scanStatus = .scanning(progress.snapshot())
+        appState.scanStarted(progress: progress.snapshot())
 
         let engine = engine
         scanTask = Task { [weak appState] in
             let poller = Task { @MainActor [weak appState] in
                 while !Task.isCancelled {
-                    appState?.scanStatus = .scanning(progress.snapshot())
+                    appState?.scanProgress = progress.snapshot()
                     try? await Task.sleep(for: Self.progressSamplingInterval)
                 }
             }
@@ -49,24 +48,30 @@ final class ScanCoordinator {
                 }
                 guard !Task.isCancelled, let appState else { return }
                 poller.cancel()
-                appState.setScanCompleted(root: result.root, report: result.report)
+                appState.scanFinished(root: result.root, report: result.report)
                 persist(result)
             } catch is CancellationError {
                 return
             } catch {
                 guard !Task.isCancelled else { return }
-                appState?.scanStatus = .error(error.localizedDescription)
+                appState?.scanFailed(message: error.localizedDescription)
             }
         }
     }
 
-    /// Rescans the current root with its original options.
+    /// Rescans the current results' root with its original options.
     func rescan(mode: ScanMode) {
-        guard let report = appState.lastReport else { return }
+        guard let report = appState.results?.report else { return }
         startScan(path: report.rootPath, options: report.options, mode: mode)
     }
 
+    /// Stops the running scan and returns to the previous results, if any.
     func cancel() {
+        cancelRunningScan()
+        if appState.isScanning { appState.scanCancelled() }
+    }
+
+    private func cancelRunningScan() {
         scanTask?.cancel()
         scanTask = nil
     }
