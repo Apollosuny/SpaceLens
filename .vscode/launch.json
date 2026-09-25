@@ -1,0 +1,24 @@
+{
+  "configurations": [
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:SpaceLens}",
+      "name": "Debug SpaceLens",
+      "target": "SpaceLens",
+      "configuration": "debug",
+      "preLaunchTask": "swift: Build Debug SpaceLens"
+    },
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:SpaceLens}",
+      "name": "Release SpaceLens",
+      "target": "SpaceLens",
+      "configuration": "release",
+      "preLaunchTask": "swift: Build Release SpaceLens"
+    }
+  ]
+}
