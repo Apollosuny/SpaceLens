@@ -7,7 +7,9 @@ struct TreemapView: View {
     let sizeMetric: SizeMetric
 
     @State private var items: [TreemapItem] = []
-    @State private var hoveredItemID: Int?
+    /// Incremented whenever `items` is replaced; lets the base canvas skip redraws cheaply.
+    @State private var layoutGeneration = 0
+    @State private var hoveredItem: TreemapItem?
     @State private var selectedItemID: Int?
     @State private var lastSize: CGSize = .zero
     @State private var layoutTask: Task<Void, Never>?
@@ -16,10 +18,9 @@ struct TreemapView: View {
     @State private var showLabels: Bool = true
     @State private var labelDebounce: Task<Void, Never>?
 
-    private var hoveredNode: FileNode? {
-        guard let id = hoveredItemID else { return nil }
-        return items.first { $0.id == id }?.node
-    }
+    /// Delay before re-laying out after a size change, so live window resizing doesn't queue a layout
+    /// per frame.
+    private static let relayoutDebounce = Duration.milliseconds(80)
 
     var body: some View {
         VStack(spacing: 0) {
@@ -28,17 +29,18 @@ struct TreemapView: View {
                 // Base treemap — only redraws when items or selection change
                 TreemapBaseCanvas(
                     items: items,
+                    layoutGeneration: layoutGeneration,
                     selectedItemID: selectedItemID,
                     zoomScale: zoomScale,
                     panOffset: panOffset,
                     showLabels: showLabels,
                     sizeMetric: sizeMetric
                 )
+                .equatable()
 
                 // Lightweight hover overlay — redraws only the single highlight rect
                 TreemapHoverOverlay(
-                    items: items,
-                    hoveredItemID: hoveredItemID,
+                    hoveredRect: hoveredItem?.rect,
                     zoomScale: zoomScale,
                     panOffset: panOffset
                 )
@@ -46,9 +48,10 @@ struct TreemapView: View {
             .onContinuousHover { phase in
                 switch phase {
                 case .active(let location):
-                    hoveredItemID = hitTestID(at: screenToContent(location))
+                    let item = hitTestItem(at: screenToContent(location))
+                    if item?.id != hoveredItem?.id { hoveredItem = item }
                 case .ended:
-                    hoveredItemID = nil
+                    hoveredItem = nil
                 }
             }
             .onTapGesture(count: 2) { location in
@@ -63,8 +66,7 @@ struct TreemapView: View {
                 }
             }
             .contextMenu {
-                if let hoveredID = hoveredItemID,
-                   let item = items.first(where: { $0.id == hoveredID }) {
+                if let item = hoveredItem {
                     Button("Reveal in Finder") {
                         revealInFinder(node: item.node)
                     }
@@ -113,7 +115,7 @@ struct TreemapView: View {
         }
         .background(.black)
 
-        TreemapStatusBar(node: hoveredNode, sizeMetric: sizeMetric)
+        TreemapStatusBar(node: hoveredItem?.node, sizeMetric: sizeMetric)
         }
         .focusedSceneValue(\.zoomInAction) {
             let center = CGPoint(x: lastSize.width / 2, y: lastSize.height / 2)
@@ -172,15 +174,6 @@ struct TreemapView: View {
         panOffset.y = min(0, max(viewSize.height - contentHeight, panOffset.y))
     }
 
-    private func hitTestID(at point: CGPoint) -> Int? {
-        for item in items.reversed() {
-            if item.rect.contains(point: point) {
-                return item.id
-            }
-        }
-        return nil
-    }
-
     private func hitTestItem(at point: CGPoint) -> TreemapItem? {
         for item in items.reversed() {
             if item.rect.contains(point: point) {
@@ -195,14 +188,27 @@ struct TreemapView: View {
         lastSize = size
 
         let metric = sizeMetric
+        let isInitialLayout = items.isEmpty
         layoutTask?.cancel()
-        layoutTask = Task.detached { [root] in
-            let engine = TreemapLayoutEngine()
-            let bounds = TreemapRect(x: 0, y: 0, width: Double(size.width), height: Double(size.height))
-            let newItems = engine.layout(root: root, in: bounds, sizeMetric: metric)
-            await MainActor.run {
-                items = newItems
+        layoutTask = Task { [root] in
+            if !isInitialLayout {
+                try? await Task.sleep(for: Self.relayoutDebounce)
             }
+            guard !Task.isCancelled else { return }
+            let layout = Task.detached(priority: .userInitiated) {
+                let bounds = TreemapRect(x: 0, y: 0, width: Double(size.width), height: Double(size.height))
+                return TreemapLayoutEngine().layout(root: root, in: bounds, sizeMetric: metric)
+            }
+            let newItems = await withTaskCancellationHandler {
+                await layout.value
+            } onCancel: {
+                layout.cancel()
+            }
+            // A newer layout was requested meanwhile; never let a stale result overwrite it.
+            guard !Task.isCancelled else { return }
+            items = newItems
+            layoutGeneration += 1
+            hoveredItem = nil
         }
     }
 
@@ -215,8 +221,9 @@ struct TreemapView: View {
 /// Heavy canvas that renders all treemap items with fills, borders, labels.
 /// Extracted as a separate view so SwiftUI skips re-rendering it when only
 /// the hovered item changes.
-private struct TreemapBaseCanvas: View {
+private struct TreemapBaseCanvas: View, Equatable {
     let items: [TreemapItem]
+    let layoutGeneration: Int
     let selectedItemID: Int?
     let zoomScale: CGFloat
     let panOffset: CGPoint
@@ -227,7 +234,6 @@ private struct TreemapBaseCanvas: View {
         Canvas { context, size in
             let renderer = TreemapRenderer(
                 items: items,
-                hoveredItemID: nil,
                 selectedItemID: selectedItemID,
                 zoomScale: zoomScale,
                 panOffset: panOffset,
@@ -239,24 +245,35 @@ private struct TreemapBaseCanvas: View {
     }
 }
 
+extension TreemapBaseCanvas {
+    /// Compares the layout generation instead of the (large, non-Equatable) item array, so hover-driven
+    /// body updates of the parent never redraw tens of thousands of rects.
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.layoutGeneration == rhs.layoutGeneration
+            && lhs.selectedItemID == rhs.selectedItemID
+            && lhs.zoomScale == rhs.zoomScale
+            && lhs.panOffset == rhs.panOffset
+            && lhs.showLabels == rhs.showLabels
+            && lhs.sizeMetric == rhs.sizeMetric
+    }
+}
+
 /// Lightweight overlay that draws only the hover highlight rectangle.
 /// Re-renders on every hover change but only paints a single translucent rect.
 private struct TreemapHoverOverlay: View {
-    let items: [TreemapItem]
-    let hoveredItemID: Int?
+    let hoveredRect: TreemapRect?
     let zoomScale: CGFloat
     let panOffset: CGPoint
 
     var body: some View {
         Canvas { context, _ in
-            guard let hoveredID = hoveredItemID,
-                  let item = items.first(where: { $0.id == hoveredID }) else { return }
+            guard let rect = hoveredRect else { return }
 
             let screenRect = CGRect(
-                x: panOffset.x + item.rect.x * zoomScale,
-                y: panOffset.y + item.rect.y * zoomScale,
-                width: item.rect.width * zoomScale,
-                height: item.rect.height * zoomScale
+                x: panOffset.x + rect.x * zoomScale,
+                y: panOffset.y + rect.y * zoomScale,
+                width: rect.width * zoomScale,
+                height: rect.height * zoomScale
             )
             let path = Path(roundedRect: screenRect.insetBy(dx: 0.5, dy: 0.5), cornerRadius: 1)
             context.fill(path, with: .color(.white.opacity(0.25)))
