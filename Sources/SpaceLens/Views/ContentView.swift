@@ -54,10 +54,11 @@ struct ContentView: View {
                     Picker("View", selection: $state.chartStyle) {
                         Label("Treemap", systemImage: "square.grid.2x2").tag(ChartStyle.treemap)
                         Label("Sunburst", systemImage: "chart.pie").tag(ChartStyle.sunburst)
+                        Label("Cleanup", systemImage: "sparkles").tag(ChartStyle.cleanup)
                     }
                     .pickerStyle(.segmented)
                     .labelStyle(.iconOnly)
-                    .help("Show folders as a treemap or as rings")
+                    .help("Show folders as a treemap or as rings, or list cleanup suggestions")
                 }
 
                 ToolbarItem(placement: .primaryAction) {
@@ -145,7 +146,11 @@ struct ContentView: View {
                     results: results,
                     sizeMetric: appState.sizeMetric,
                     colorMode: appState.colorMode,
-                    chartStyle: appState.chartStyle
+                    chartStyle: appState.chartStyle,
+                    onShowInChart: { node in
+                        appState.chartStyle = .treemap
+                        results.select(node)
+                    }
                 )
             }
 

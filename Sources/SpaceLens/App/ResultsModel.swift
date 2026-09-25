@@ -22,11 +22,20 @@ final class ResultsModel {
     @ObservationIgnored private var breakdowns: [FileNode: CategoryBreakdown] = [:]
     @ObservationIgnored private var pendingBreakdowns: [FileNode: Task<CategoryBreakdown, Never>] = [:]
 
-    init(root: FileNode, report: ScanReport) {
+    /// Cleanup suggestions for the whole scan; nil until the background analysis finishes.
+    private(set) var cleanupReport: CleanupReport?
+
+    init(root: FileNode, report: ScanReport, cleanupAnalyzer: CleanupAnalyzer = CleanupAnalyzer()) {
         self.root = root
         self.report = report
         self.viewRoot = root
         self.selection = root
+
+        // One walk of the tree, once per scan: both the Cleanup view and the inspector read the result.
+        Task { [weak self] in
+            let report = await Task.detached(priority: .utility) { cleanupAnalyzer.analyze(root) }.value
+            self?.cleanupReport = report
+        }
     }
 
     /// The path from the scan root to `viewRoot`.

@@ -16,6 +16,8 @@ enum ColorMode: String, CaseIterable, Sendable {
 enum ChartStyle: String, CaseIterable, Sendable {
     case treemap
     case sunburst
+    /// Not a chart: the cleanup suggestions for the whole scan.
+    case cleanup
 }
 
 /// App-wide state: which screen is shown, the current results and scan progress.

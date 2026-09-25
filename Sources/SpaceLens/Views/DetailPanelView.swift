@@ -36,6 +36,15 @@ struct DetailPanelView: View {
             }
             .monospacedDigit()
 
+            Section("Cleanup") {
+                if let cleanupReport = results.cleanupReport {
+                    CleanupVerdictView(verdict: cleanupReport.verdict(for: node))
+                } else {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+
             if node.isDirectory && !breakdown.isEmpty {
                 Section("By Category") {
                     CategoryBar(breakdown: breakdown)

@@ -6,6 +6,8 @@ struct ResultsView: View {
     let sizeMetric: SizeMetric
     let colorMode: ColorMode
     let chartStyle: ChartStyle
+    /// Leaves the Cleanup list for a chart, showing `node` there.
+    let onShowInChart: (FileNode) -> Void
 
     var body: some View {
         let viewRoot = results.viewRoot
@@ -15,11 +17,14 @@ struct ResultsView: View {
                 InaccessibleFoldersBanner(report: results.report)
             }
 
-            BreadcrumbBar(
-                breadcrumbs: results.breadcrumbs,
-                sizeMetric: sizeMetric,
-                onNavigate: { results.open($0) }
-            )
+            // Cleanup covers the whole scan, so the folder navigation and legend only belong to the charts.
+            if chartStyle != .cleanup {
+                BreadcrumbBar(
+                    breadcrumbs: results.breadcrumbs,
+                    sizeMetric: sizeMetric,
+                    onNavigate: { results.open($0) }
+                )
+            }
 
             switch chartStyle {
             case .treemap:
@@ -43,13 +48,17 @@ struct ResultsView: View {
                     onOpen: { results.open($0) },
                     onNavigateUp: { results.navigateUp() }
                 )
+            case .cleanup:
+                CleanupView(results: results, onShowInChart: onShowInChart)
             }
 
-            switch colorMode {
-            case .folder:
-                FolderLegendBar(node: viewRoot, sizeMetric: sizeMetric, onSelect: { results.select($0) })
-            case .kind:
-                CategoryLegendBar(results: results, node: viewRoot)
+            if chartStyle != .cleanup {
+                switch colorMode {
+                case .folder:
+                    FolderLegendBar(node: viewRoot, sizeMetric: sizeMetric, onSelect: { results.select($0) })
+                case .kind:
+                    CategoryLegendBar(results: results, node: viewRoot)
+                }
             }
         }
         .navigationTitle(viewRoot.displayName)
